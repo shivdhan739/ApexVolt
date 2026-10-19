@@ -1,0 +1,536 @@
+<!doctype html>
+<!--
+FIRESTORE RULES (paste in Firebase Console > Firestore Database > Rules > Publish). Not part of the page.
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function apexOk() { return request.auth != null; }
+    function apexAdmin() { return apexOk() && exists(/databases/$(database)/documents/apexAdmins/$(request.auth.uid)); }
+    match /apexAdmins/{uid} { allow read: if request.auth != null && request.auth.uid == uid; allow write: if false; }
+    match /apexUsers/{uid} {
+      allow read: if apexOk() && (request.auth.uid == uid || apexAdmin());
+      allow create: if apexOk() && request.auth.uid == uid
+        && request.resource.data.loginCount == 1
+        && !('aadhaarNumber' in request.resource.data) && !('aadhaarNumber' in request.resource.data.kyc)
+        && request.resource.data.kyc.aadhaarLast4.size() == 4;
+      allow update: if apexOk() && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['loginCount','lastLoginAt'])
+        && request.resource.data.loginCount == resource.data.loginCount + 1;
+      match /logins/{lid} {
+        allow create, update: if apexOk() && request.auth.uid == uid;
+        allow read: if apexOk() && (request.auth.uid == uid || apexAdmin());
+      }
+    }
+    function xfer(acc) {
+      let t = getAfter(/databases/$(database)/documents/apexTxns/$(request.resource.data.lastTx)).data;
+      let d = request.resource.data.balancePaise - resource.data.balancePaise;
+      let f = /databases/$(database)/documents/apexAccounts/$(t.fromAcc);
+      return t.type == 'TRANSFER' && t.fromAcc != t.toAcc && t.fromUid == request.auth.uid && t.amountPaise > 0
+        && ((t.fromAcc == acc && resource.data.uid == request.auth.uid && d == -t.amountPaise)
+         || (t.toAcc == acc && d == t.amountPaise && get(f).data.uid == request.auth.uid
+             && getAfter(f).data.balancePaise == get(f).data.balancePaise - t.amountPaise));
+    }
+    function addm(acc) {
+      let t = getAfter(/databases/$(database)/documents/apexTxns/$(request.resource.data.lastTx)).data;
+      return t.type == 'ADD_MONEY' && t.toAcc == acc && t.toUid == request.auth.uid && resource.data.uid == request.auth.uid
+        && t.amountPaise > 0 && t.amountPaise <= 10000000 && request.resource.data.balancePaise - resource.data.balancePaise == t.amountPaise;
+    }
+    match /apexDirectory/{acc} { allow read: if apexOk(); allow create: if apexOk() && request.resource.data.uid == request.auth.uid; }
+    match /apexTxns/{id} {
+      allow read: if apexOk() && (resource.data.fromUid == request.auth.uid || resource.data.toUid == request.auth.uid || apexAdmin());
+      allow create: if apexOk() && request.resource.data.amountPaise is int && request.resource.data.amountPaise > 0
+        && ((request.resource.data.type == 'TRANSFER' && request.resource.data.fromUid == request.auth.uid)
+         || (request.resource.data.type == 'ADD_MONEY' && request.resource.data.toUid == request.auth.uid && request.resource.data.fromUid == 'BANK'));
+    }
+    match /apexAccounts/{acc} {
+      allow read: if apexOk() && (resource.data.uid == request.auth.uid || apexAdmin());
+      allow create: if apexOk() && acc.matches('[1-9][0-9]{11}')
+        && request.resource.data.uid == request.auth.uid && request.resource.data.balancePaise == 0
+        && request.resource.data.status == 'ACTIVE'
+        && !exists(/databases/$(database)/documents/apexUsers/$(request.auth.uid));
+      allow update: if apexOk() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['balancePaise','updatedAt','lastTx'])
+        && request.resource.data.balancePaise >= 0 && (xfer(acc) || addm(acc));
+    }
+    match /apexPins/{uid} { allow read, write: if apexOk() && request.auth.uid == uid; }
+    match /apexAudit/{id} { allow create: if apexOk() && request.resource.data.uid == request.auth.uid; allow read: if apexAdmin(); }
+  }
+}
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ApexVolt Neo-Bank</title>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
+<style>
+:root{--bg:#0b1020;--card:#131a33;--line:#26305c;--text:#e9ecff;--mute:#9aa4d4;--acc:#3ddc97;--bad:#ff8a8a}
+@media(prefers-color-scheme:light){:root{--bg:#f2f4fb;--card:#fff;--line:#d5daf0;--text:#10163a;--mute:#566091;--acc:#0b8a57;--bad:#c62828}}
+*{box-sizing:border-box}
+html{height:100%}
+body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,sans-serif;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+.wrap{max-width:560px;margin:0 auto;padding:16px}
+header{display:flex;gap:8px;align-items:baseline;margin:8px 0 14px}.logo{font-weight:800;font-size:1.4rem}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px;display:flex;flex-direction:column;gap:10px}
+h2,h3{margin:0}
+input,button{font:inherit;color:inherit;padding:11px;border-radius:8px;border:1px solid var(--line);background:transparent}
+button{cursor:pointer}button.primary{background:var(--acc);color:#04130c;font-weight:700;border-color:var(--acc)}
+button.link{border:0;color:var(--mute);text-decoration:underline;padding:4px}
+button:focus-visible,input:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row>input{flex:1;min-width:140px}.between{justify-content:space-between;align-items:center}
+.grid{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;margin:0}dt{color:var(--mute)}dd{margin:0;text-align:right;word-break:break-all}
+.big{font-size:2rem;font-weight:800}.sub,.note{color:var(--mute)}.err{color:var(--bad);margin:0}.ok{color:var(--acc)}
+.banner{background:var(--line);border-radius:8px;padding:8px 12px;font-size:.9rem}
+.wrap{padding-bottom:96px}
+.hero{background:linear-gradient(135deg,#3b1a78,#6c2bd9);color:#fff;border-radius:16px;padding:18px;margin-bottom:14px;display:flex;flex-direction:column;gap:6px}.hero .sub{color:#e0d4ff}.hero .link{color:#fff}
+.acts{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}.acts button{display:flex;flex-direction:column;align-items:center;gap:4px;background:var(--card);padding:12px;font-size:1.5rem}.acts span{font-size:.8rem;color:var(--mute)}
+.tx{display:flex;gap:10px;align-items:center;padding:9px 0;border-bottom:1px solid var(--line)}.tx .mid{flex:1;display:flex;flex-direction:column;min-width:0}.ic{width:38px;height:38px;border-radius:50%;display:grid;place-items:center;font-weight:800;flex:none}.ic.cr{background:#3ddc9733;color:var(--acc)}.ic.dr{background:#ff8a8a33;color:var(--bad)}
+.nav{position:fixed;left:0;right:0;bottom:0;display:flex;justify-content:space-around;background:var(--card);border-top:1px solid var(--line);padding:6px 0 calc(6px + env(safe-area-inset-bottom))}.nav button{border:0;display:flex;flex-direction:column;align-items:center;font-size:.75rem;padding:4px 16px}.nav .on{color:var(--acc);font-weight:700}
+.tbl{width:100%;border-collapse:collapse;font-size:.82rem}.tbl th,.tbl td{padding:7px 5px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}.tbl th{color:var(--mute);font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header><span class="logo">⚡ ApexVolt</span><span class="sub">Neo-Bank</span></header>
+  <div id="banner"></div>
+  <div id="view"></div>
+</div>
+
+<script>
+/* ====== PASTE YOUR FIREBASE CONFIG HERE (Firebase Console > Project settings > Your apps > Web app) ====== */
+const CFG = {
+  apiKey: "AIzaSyBrbsqKYfRVXcW0S94LjBTpwrBCC-S6CTc",
+  authDomain: "apexvolt-bank.firebaseapp.com",
+  projectId: "apexvolt-bank",
+  storageBucket: "apexvolt-bank.firebasestorage.app",
+  messagingSenderId: "653514738382",
+  appId: "1:653514738382:web:bed82cddb2757232975e9f"
+};
+/* ====== end of config ====== */
+/* ====== EmailJS (same account/template as the MPSC quiz) ====== */
+const ADMIN_EMAIL = "shivdhanshirgole085@gmail.com";
+const EJS = { SERVICE_ID: "service_utiba9a", TEMPLATE_ID: "template_6tesf8r", PUBLIC_KEY: "ly0Z7_DwsSGmyS0l_" };
+try { if (window.emailjs) emailjs.init({ publicKey: EJS.PUBLIC_KEY }); } catch (e) {}
+async function sendEJS(params) {
+  if (!window.emailjs) return { ok: false, reason: "EmailJS script not loaded" };
+  try { const r = await emailjs.send(EJS.SERVICE_ID, EJS.TEMPLATE_ID, params); return { ok: r.status === 200 }; }
+  catch (e) { return { ok: false, reason: e.text || e.message || "send_failed" }; }
+}
+const notify = (to, subject, message) => to && sendEJS({ to_email: to, to_name: "Customer", from_name: "ApexVolt Neo-Bank", subject,
+  message: "ApexVolt Neo-Bank\n\n" + message + "\n\nTime: " + new Date().toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) + "\n\nIf this wasn't you, please contact support.",
+  cust_email: to, cust_mobile: "—", reg_time: new Date().toLocaleString("en-IN") });
+const genOtp = () => String(100000 + (crypto.getRandomValues(new Uint32Array(1))[0] % 900000));
+let pendingReg = null, regInfo = null, lastOtpAt = 0;
+async function otpStart(name, email, pass) {
+  if (Date.now() - lastOtpAt < 30000) throw new Error("Please wait 30 seconds before requesting another OTP");
+  const otp = genOtp(), now = new Date().toLocaleString("en-IN", { dateStyle: "full", timeStyle: "short" });
+  const r = await sendEJS({
+    to_email: email, to_name: name || email, from_name: "ApexVolt Neo-Bank", subject: "Your ApexVolt registration OTP",
+    message: `ApexVolt Neo-Bank\n\nHello ${name || ""},\n\nYour registration OTP is: ${otp}\n\nValid for 10 minutes. Do not share it with anyone.\n\nTime: ${now}`,
+    cust_email: email, cust_mobile: "—", reg_time: now });
+  if (!r.ok) throw new Error("Could not send OTP (" + (r.reason || "unknown") + ")");
+  lastOtpAt = Date.now();
+  regInfo = { name, email, pass };
+  pendingReg = { otp, exp: Date.now() + 600000, tries: 0 };
+}
+async function otpVerify(code) {
+  const p = pendingReg;
+  if (!p || !regInfo) throw new Error("OTP not found - please resend");
+  if (Date.now() > p.exp) { pendingReg = null; throw new Error("OTP expired - please resend"); }
+  if (p.otp !== code) { if (++p.tries >= 5) { pendingReg = null; throw new Error("Too many wrong attempts - request a new OTP"); } throw new Error("Wrong OTP"); }
+  pendingReg = null;
+  const ri = regInfo, at = new Date().toLocaleString("en-IN", { dateStyle: "full", timeStyle: "short" });
+  await svc.signup(ri.name, ri.email, ri.pass);
+  regInfo = null;
+  sendEJS({ to_email: ADMIN_EMAIL, to_name: "Admin", from_name: "ApexVolt Neo-Bank", subject: "New user registered: " + ri.name,
+    message: `New user registered on ApexVolt.\n\nName: ${ri.name}\nEmail: ${ri.email}\nTime: ${at}`, cust_email: ri.email, cust_mobile: "—", reg_time: at });
+}
+const LIVE = !!(window.firebase && CFG.apiKey && !CFG.apiKey.startsWith("YOUR"));
+const IFSC = "APEX0000001";
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const inr = (p) => (p / 100).toLocaleString("en-IN", { style: "currency", currency: "INR" });
+const newAcc = () => String(Math.floor(1e11 + Math.random() * 9e11));
+/* Aadhaar checksum (Verhoeff) - format check only; real verification needs a UIDAI-licensed eKYC provider */
+const VD=[[0,1,2,3,4,5,6,7,8,9],[1,2,3,4,0,6,7,8,9,5],[2,3,4,0,1,7,8,9,5,6],[3,4,0,1,2,8,9,5,6,7],[4,0,1,2,3,9,5,6,7,8],[5,9,8,7,6,0,4,3,2,1],[6,5,9,8,7,1,0,4,3,2],[7,6,5,9,8,2,1,0,4,3],[8,7,6,5,9,3,2,1,0,4],[9,8,7,6,5,4,3,2,1,0]];
+const VP=[[0,1,2,3,4,5,6,7,8,9],[1,5,7,6,2,8,3,0,9,4],[5,8,0,3,7,9,6,1,4,2],[8,9,1,6,0,4,3,5,2,7],[9,4,5,3,1,2,6,8,7,0],[4,2,8,6,5,7,3,9,0,1],[2,7,9,3,8,0,6,4,1,5],[7,0,4,6,9,1,3,2,5,8]];
+const verhoeff = (n) => { let c = 0; n.split("").reverse().forEach((d, i) => { c = VD[c][VP[i % 8][+d]]; }); return c === 0; };
+const validAadhaar = (a) => /^[2-9][0-9]{11}$/.test(a) && verhoeff(a);
+const ageOf = (dob) => { const d = new Date(dob), n = new Date(); let a = n.getFullYear() - d.getFullYear(); if (n < new Date(n.getFullYear(), d.getMonth(), d.getDate())) a--; return a; };
+const fmtErr = (e) => (e && e.code ? String(e.code).replace(/^auth\//, "").replace(/-/g, " ") : (e && e.message) || "Something went wrong");
+
+/* ================= Service layer: Firebase (LIVE) ================= */
+let auth, db;
+const FS = () => firebase.firestore.FieldValue;
+const mapUser = (u) => u && { uid: u.uid, email: u.email, name: u.displayName, emailVerified: u.emailVerified };
+
+/* login history: every login = one doc in apexUsers/{uid}/logins, duration updated every 30s */
+let sessId = null, sessStart = 0, sessTimer = null;
+const sessTouch = () => {
+  if (!(db && auth && auth.currentUser && sessId)) return Promise.resolve();
+  const sec = Math.round((Date.now() - sessStart) / 1000);
+  return db.collection("apexUsers").doc(auth.currentUser.uid).collection("logins").doc(sessId)
+    .set({ duration: sec, logoutTime: new Date(sessStart + sec * 1000).toISOString() }, { merge: true }).catch(() => {});
+};
+async function sessBegin(uid) {
+  if (sessionStorage.apexSess) { sessId = sessionStorage.apexSess; sessStart = +sessionStorage.apexSessStart || Date.now(); }
+  else {
+    sessStart = Date.now();
+    const ref = await db.collection("apexUsers").doc(uid).collection("logins").add({ time: new Date(sessStart).toISOString(), duration: 0 });
+    sessId = ref.id; sessionStorage.apexSess = sessId; sessionStorage.apexSessStart = String(sessStart);
+  }
+  clearInterval(sessTimer); sessTimer = setInterval(sessTouch, 30000);
+}
+async function sessEnd() {
+  clearInterval(sessTimer); await sessTouch(); sessId = null;
+  sessionStorage.removeItem("apexSess"); sessionStorage.removeItem("apexSessStart");
+}
+window.addEventListener("beforeunload", () => { sessTouch(); });
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") sessTouch(); });
+
+const fbSvc = {
+  init() { firebase.initializeApp(CFG); auth = firebase.auth(); db = firebase.firestore(); },
+  current: () => mapUser(auth.currentUser),
+  onUser: (cb) => auth.onAuthStateChanged((u) => cb(mapUser(u))),
+  async signup(name, email, pass) {
+    const { user } = await auth.createUserWithEmailAndPassword(email, pass);
+    await user.updateProfile({ displayName: name }); // email already verified by OTP (EmailJS)
+  },
+  login: (e, p) => auth.signInWithEmailAndPassword(e, p),
+  async logout() { await sessEnd(); await auth.signOut(); },
+  async enter(u) {
+    const ur = db.collection("apexUsers").doc(u.uid);
+    const snap = await ur.get();
+    if (!snap.exists) return { needKyc: true };
+    if (!sessionStorage.apexLogged) await ur.update({ loginCount: FS().increment(1), lastLoginAt: FS().serverTimestamp() });
+    sessionStorage.apexLogged = "1";
+    try { await sessBegin(u.uid); } catch (e) { console.error("login log failed", e); }
+    const d = (await ur.get()).data();
+    try { const dr = db.collection("apexDirectory").doc(d.accountNumber); if (!(await dr.get()).exists) await dr.set({ uid: u.uid, fullName: d.fullName }); } catch (e) {}
+    let isAdmin = false;
+    try { isAdmin = (await db.collection("apexAdmins").doc(u.uid).get()).exists; } catch (e) {}
+    return { ...d, ifsc: IFSC, isAdmin };
+  },
+  async openAccount(u, k) {
+    const ur = db.collection("apexUsers").doc(u.uid);
+    for (let i = 0; i < 6; i++) {
+      const acc = newAcc(), b = db.batch();
+      b.set(db.collection("apexAccounts").doc(acc), { uid: u.uid, fullName: k.fullName, ifsc: IFSC, balancePaise: 0, status: "ACTIVE", accountType: k.accountType, phone: k.phone, createdAt: FS().serverTimestamp() });
+      b.set(ur, { fullName: k.fullName, email: u.email, phone: k.phone, phoneVerified: false, accountNumber: acc, loginCount: 1, createdAt: FS().serverTimestamp(), lastLoginAt: FS().serverTimestamp(), kyc: k.kyc });
+      b.set(db.collection("apexDirectory").doc(acc), { uid: u.uid, fullName: k.fullName });
+      try { await b.commit(); sessionStorage.apexLogged = "1"; return; } catch (e) { if (i === 5) throw e; } // retry on account-number collision
+    }
+  },
+  watch: (acc, cb) => db.collection("apexAccounts").doc(acc).onSnapshot((s) => s.exists && cb(s.data().balancePaise)),
+  async search(acc) {
+    try {
+      const s = await db.collection("apexAccounts").doc(acc).get(); // real-time query
+      return s.exists ? { accountNumber: acc, ...s.data() } : null;
+    } catch (e) { if (e.code === "permission-denied") return null; throw e; } // hidden accounts look "not found"
+  },
+  async adminUsers() {
+    const us = await db.collection("apexUsers").get();
+    const rows = await Promise.all(us.docs.map(async (d) => {
+      const x = d.data(); let logins = [];
+      try { logins = (await d.ref.collection("logins").orderBy("time", "desc").limit(50).get()).docs.map((l) => l.data()); } catch (e) {}
+      return { uid: d.id, fullName: x.fullName, email: x.email, phone: x.phone, accountNumber: x.accountNumber, loginCount: x.loginCount || 0, logins };
+    }));
+    return rows.sort((a, b) => ((b.logins[0] && b.logins[0].time) || "").localeCompare((a.logins[0] && a.logins[0].time) || ""));
+  },
+  async addMoney(uid, me, amt, ref) {
+    const aref = db.collection("apexAccounts").doc(me.accountNumber), tx = db.collection("apexTxns").doc();
+    await db.runTransaction(async (t) => {
+      const x = await t.get(aref); if (!x.exists) throw new Error("Account not found");
+      t.update(aref, { balancePaise: x.data().balancePaise + amt, updatedAt: FS().serverTimestamp(), lastTx: tx.id });
+      t.set(tx, { type: "ADD_MONEY", fromAcc: "BANK", fromUid: "BANK", fromName: "Add money", toAcc: me.accountNumber, toUid: uid, toName: me.fullName, amountPaise: amt, note: ref || "", ts: Date.now() });
+    });
+  },
+  async lookup(acc) { const x = await db.collection("apexDirectory").doc(acc).get(); return x.exists ? x.data() : null; },
+  async txns(uid) {
+    const [a, b] = await Promise.all([db.collection("apexTxns").where("fromUid", "==", uid).get(), db.collection("apexTxns").where("toUid", "==", uid).get()]);
+    const m = {}; [...a.docs, ...b.docs].forEach((d) => { m[d.id] = { id: d.id, ...d.data() }; });
+    return Object.values(m).sort((x, y) => y.ts - x.ts);
+  },
+  async allTxns() { return (await db.collection("apexTxns").get()).docs.map((d) => d.data()).sort((x, y) => y.ts - x.ts); },
+  async transfer(uid, me, p) {
+    const fromRef = db.collection("apexAccounts").doc(me.accountNumber), toRef = db.collection("apexAccounts").doc(p.acc), txRef = db.collection("apexTxns").doc();
+    await db.runTransaction(async (t) => {
+      const s = await t.get(fromRef); if (!s.exists) throw new Error("Your account was not found");
+      const nb = s.data().balancePaise - p.amt; if (nb < 0) throw new Error("Insufficient balance");
+      t.update(fromRef, { balancePaise: nb, updatedAt: FS().serverTimestamp(), lastTx: txRef.id });
+      t.update(toRef, { balancePaise: FS().increment(p.amt), updatedAt: FS().serverTimestamp(), lastTx: txRef.id });
+      t.set(txRef, { type: "TRANSFER", fromAcc: me.accountNumber, fromUid: uid, fromName: me.fullName, toAcc: p.acc, toUid: p.uid, toName: p.name, amountPaise: p.amt, note: p.note || "", ts: Date.now() });
+    });
+  },
+  async adjust(acc, delta, reason, me) {
+    const ref = db.collection("apexAccounts").doc(acc), tx = db.collection("apexTxns").doc();
+    await db.runTransaction(async (t) => {
+      const s = await t.get(ref);
+      if (!s.exists) throw new Error("Secure Banking Exception: Account Not Found");
+      const d = s.data(), nb = d.balancePaise + delta, cr = delta > 0;
+      if (nb < 0) throw new Error("Balance cannot go below zero");
+      t.update(ref, { balancePaise: nb, updatedAt: FS().serverTimestamp(), lastTx: tx.id });
+      t.set(tx, { type: cr ? "ADMIN_CREDIT" : "ADMIN_DEBIT", fromAcc: cr ? "BANK" : acc, fromUid: cr ? "BANK" : d.uid, fromName: cr ? "ApexVolt Bank" : d.fullName,
+        toAcc: cr ? acc : "BANK", toUid: cr ? d.uid : "BANK", toName: cr ? d.fullName : "ApexVolt Bank", amountPaise: Math.abs(delta), note: reason, ts: Date.now() });
+    });
+    db.collection("apexAudit").add({ uid: me.uid, action: "BALANCE_ADJUST", account: acc, deltaPaise: delta, reason, at: FS().serverTimestamp() }).catch(() => {});
+  },
+};
+
+const svc = fbSvc;
+
+/* ================= UI ================= */
+const S = { needKyc: false, user: undefined, me: null, bal: null, err: "", msg: "", mode: "login", otpSent: false, res: null, sErr: "", unwatch: null, busy: false, users: null, usersErr: "", tab: "home", txns: [], allTx: null, pay: null, ok: "", reqs: [], pending: null, balShow: false, pinMode: "", pinSet: null, pinDoc: null };
+
+const fmtDT = (t) => t ? new Date(t).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : "—";
+const fmtDur = (n) => { n = n || 0; const h = Math.floor(n / 3600), m = Math.floor((n % 3600) / 60); return h ? `${h} hr ${m} min` : m ? `${m} min` : `${n} sec`; };
+const adminCard = () => {
+  const t0 = new Date(); t0.setHours(0, 0, 0, 0);
+  const U = S.users, sum = (r) => r.logins.reduce((x, l) => x + (l.duration || 0), 0);
+  if (!U) return `<section class="card"><div class="row between"><h3>Users &amp; login activity</h3><button data-act="loadUsers">Load</button></div>${S.usersErr ? `<p class="err">${esc(S.usersErr)}</p>` : ""}</section>`;
+  const rows = U.flatMap((r) => r.logins.map((l) => ({ n: r.fullName, ...l }))).sort((a, b) => b.time.localeCompare(a.time)).slice(0, 100);
+  return `<section class="card"><div class="row between"><h3>Users (${U.length})</h3><button data-act="loadUsers">Refresh</button></div>${S.usersErr ? `<p class="err">${esc(S.usersErr)}</p>` : ""}
+    <div style="overflow-x:auto"><table class="tbl"><tr><th>User</th><th>Logins</th><th>Today</th><th>Total time</th><th>Last login</th></tr>${U.map((r) => `<tr><td><b>${esc(r.fullName)}</b><br><span class="note">${esc(r.email)}</span></td><td>${esc(r.loginCount)}</td><td>${r.logins.filter((l) => new Date(l.time) >= t0).length}</td><td>${fmtDur(sum(r))}</td><td>${fmtDT(r.logins[0] && r.logins[0].time)}</td></tr>`).join("")}</table></div></section>
+  <section class="card"><h3>Login activity</h3><div style="overflow-x:auto"><table class="tbl"><tr><th>User</th><th>Login</th><th>Logout</th><th>Used</th></tr>${rows.map((l) => `<tr><td>${esc(l.n)}</td><td>${fmtDT(l.time)}</td><td>${!l.logoutTime || Date.now() - new Date(l.logoutTime) < 90000 ? "<span class=ok>Active now</span>" : fmtDT(l.logoutTime)}</td><td>${fmtDur(l.duration)}</td></tr>`).join("") || `<tr><td colspan="4">No logins yet</td></tr>`}</table></div></section>`;
+};
+
+const txRow = (t, uid) => {
+  const cr = t.toUid === uid, who = t.type === "TRANSFER" ? (cr ? "From " + t.fromName : "To " + t.toName) : (t.type === "ADD_MONEY" ? "Money added" : cr ? "Credited by bank" : "Debited by bank");
+  return `<div class="tx"><div class="ic ${cr ? "cr" : "dr"}">${cr ? "↓" : "↑"}</div><div class="mid"><b>${esc(who)}</b><span class="note">${fmtDT(t.ts)}${t.note ? " · " + esc(t.note) : ""}</span></div><b class="${cr ? "ok" : "err"}">${cr ? "+" : "−"}${inr(t.amountPaise)}</b></div>`;
+};
+const txList = (a) => a.length ? a.map((t) => txRow(t, S.user.uid)).join("") : `<p class="note">No transactions yet. Send or receive money to see it here.</p>`;
+const pinIn = (id, ph) => `<input id="${id}" type="password" inputmode="numeric" maxlength="4" required placeholder="${ph}" autocomplete="off">`;
+const pinPanel = () => !S.pinMode ? "" : `<form class="card" id="${S.pinMode === "set" ? "pinSetForm" : S.pinMode === "check" ? "pinCheckForm" : "pinForgotForm"}">
+  <h3>${S.pinMode === "set" ? "Set your 4-digit PIN" : S.pinMode === "check" ? "Enter PIN to check balance" : "Reset PIN"}</h3>
+  ${S.pinMode === "forgot" ? `<input id="fpw" type="password" required placeholder="Your account password" autocomplete="current-password">` : ""}
+  ${S.pinMode === "check" ? pinIn("pin", "4-digit PIN") : pinIn("pin", S.pinMode === "set" ? "Choose 4-digit PIN" : "New 4-digit PIN") + pinIn("pin2", "Confirm PIN")}
+  ${S.sErr ? `<p class="err">${esc(S.sErr)}</p>` : ""}<button class="primary">${S.pinMode === "check" ? "Show balance" : "Save PIN"}</button>
+  ${S.pinMode === "check" ? `<button type="button" class="link" data-act="pinForgot">Forgot PIN?</button>` : ""}<button type="button" class="link" data-act="pinClose">Cancel</button></form>`;
+const homeView = () => { const m = S.me; return `<section class="hero"><div class="row between"><span>Hi, ${esc(m.fullName)}</span><button class="link" data-act="logout">Sign out</button></div>
+  <span class="sub">Available balance</span><div class="big" id="bal">${S.balShow && S.bal !== null ? inr(S.bal) : "₹ ••••••"}</div><button class="link" data-act="${S.balShow ? "hideBal" : "checkBal"}">${S.balShow ? "🙈 Hide balance" : "👁 Check balance"}</button>
+  <span class="sub">A/C ${esc(m.accountNumber)} · IFSC ${esc(m.ifsc)} · Logins ${esc(m.loginCount)}</span></section>
+  ${pinPanel()}<div class="acts"><button data-act="tab" data-t="pay">💸<span>Send</span></button><button data-act="tab" data-t="hist">📜<span>History</span></button><button data-act="stmt">⬇️<span>Statement</span></button><button data-act="tab" data-t="add">➕<span>Add money</span></button></div>
+  <section class="card"><h3>Recent transactions</h3>${txList(S.txns.slice(0, 5))}</section>`; };
+const payView = () => S.pay ? `<section class="card"><h3>Confirm payment</h3><dl class="grid"><dt>To</dt><dd>${esc(S.pay.name)}</dd><dt>Account</dt><dd>${esc(S.pay.acc)}</dd><dt>Amount</dt><dd class="big">${inr(S.pay.amt)}</dd>${S.pay.note ? `<dt>Note</dt><dd>${esc(S.pay.note)}</dd>` : ""}</dl>
+  ${pinIn("ppin", "Enter PIN to pay")}${S.sErr ? `<p class="err">${esc(S.sErr)}</p>` : ""}<div class="row"><button class="primary" data-act="payGo">Confirm &amp; send</button><button data-act="payCancel">Cancel</button></div></section>`
+  : `<form class="card" id="payForm"><h3>Send money</h3>${S.ok ? `<p class="ok">${esc(S.ok)}</p>` : ""}
+  <input id="pacc" required inputmode="numeric" maxlength="12" placeholder="Receiver account number (12 digits)"><input id="pamt" required type="number" min="1" step="0.01" placeholder="Amount ₹"><input id="pnote" maxlength="40" placeholder="Note (optional)">
+  ${S.sErr ? `<p class="err">${esc(S.sErr)}</p>` : ""}<button class="primary">Continue</button></form>`;
+const addView = () => `<form class="card" id="addForm"><h3>Add money</h3><p class="note">Money is added to your account instantly.</p>${S.ok ? `<p class="ok">${esc(S.ok)}</p>` : ""}
+  <input id="aamt" required type="number" min="1" max="100000" step="0.01" placeholder="Amount ₹ (max 1,00,000 at a time)">
+  ${S.sErr ? `<p class="err">${esc(S.sErr)}</p>` : ""}<button class="primary">Add money</button></form>`;
+const histView = () => `<section class="card"><div class="row between"><h3>Transaction history</h3><button data-act="stmt">⬇️ Statement</button></div>${txList(S.txns)}</section>`;
+const adminView = () => { const a = S.allTx, n = (ty) => a.filter((t) => t.type === ty).length;
+  return `<section class="card"><div class="row between"><h3>Transactions overview</h3><button data-act="loadAllTx">${a ? "Refresh" : "Load"}</button></div>
+  ${a ? `<dl class="grid"><dt>Total transactions</dt><dd class="big">${a.length}</dd><dt>Transfers</dt><dd>${n("TRANSFER")}</dd><dt>Money added</dt><dd>${n("ADD_MONEY")}</dd><dt>Total volume</dt><dd>${inr(a.reduce((x, t) => x + t.amountPaise, 0))}</dd></dl>` : `<p class="note">Tap Load to see numbers</p>`}</section>`
+  + adminCard() + `<section class="card"><h3>Latest transactions</h3>${a ? (a.slice(0, 100).map((t) => `<div class="tx"><div class="mid"><b>${esc(t.fromName)} → ${esc(t.toName)}</b><span class="note">${fmtDT(t.ts)} · ${esc(t.type)}${t.note ? " · " + esc(t.note) : ""}</span></div><b>${inr(t.amountPaise)}</b></div>`).join("") || `<p class="note">No transactions yet</p>`) : ""}</section>`; };
+
+const views = {
+  loading: () => `<p class="note">Loading…</p>`,
+  auth: () => S.mode === "register" && S.otpSent ? `<form class="card" id="otpForm"><h2>Verify your email</h2>
+    <p>We sent a 6-digit OTP to <b>${esc(regInfo && regInfo.email)}</b> (valid 10 minutes). Check spam too.</p>
+    <input id="otp" required inputmode="numeric" maxlength="6" placeholder="6-digit OTP" autocomplete="one-time-code">
+    ${S.msg ? `<p class="note ok">${esc(S.msg)}</p>` : ""}${S.err ? `<p class="err">${esc(S.err)}</p>` : ""}
+    <button class="primary">Verify &amp; create account</button>
+    <button type="button" class="link" data-act="resendOtp">Resend OTP</button>
+    <button type="button" class="link" data-act="changeEmail">Change email</button></form>` : `<form class="card" id="authForm">
+    <h2>${S.mode === "login" ? "Sign in" : "Open your account"}</h2>
+    ${S.mode === "register" ? `<input id="name" required placeholder="Full name" autocomplete="name">` : ""}
+    <input id="email" type="email" required placeholder="Email" autocomplete="email">
+    <input id="pass" type="password" required minlength="8" placeholder="Password (8+ chars)" autocomplete="${S.mode === "login" ? "current-password" : "new-password"}">
+    ${S.err ? `<p class="err">${esc(S.err)}</p>` : ""}
+    <button class="primary">${S.mode === "login" ? "Sign in" : "Register & send OTP"}</button>
+    <button type="button" class="link" data-act="toggle">${S.mode === "login" ? "New here? Register" : "Have an account? Sign in"}</button></form>`,
+  kyc: () => {
+    const sel = (id, arr) => `<select id="${id}" required><option value="">Select</option>${arr.map((o) => `<option>${o}</option>`).join("")}</select>`;
+    return `<form class="card" id="kycForm"><h2>Open your account</h2>
+      <p class="note">Complete KYC. Your email is verified.</p>
+      <input id="fullName" required placeholder="Full name (as on Aadhaar/PAN)" value="${esc(S.user.name || "")}" autocomplete="name">
+      <div class="row"><input id="dob" type="date" required aria-label="Date of birth"><select id="gender" required aria-label="Gender"><option value="">Gender</option><option>Male</option><option>Female</option><option>Other</option></select></div>
+      <input id="fatherName" required placeholder="Father's / spouse's name">
+      <input id="mobile" required inputmode="numeric" maxlength="10" placeholder="Mobile number (10 digits)" autocomplete="tel-national" aria-label="Mobile number">
+      <input id="emailRO" readonly value="${esc(S.user.email)}" aria-label="Email">
+      <input id="addr" required placeholder="Address (house, street, area)" autocomplete="street-address">
+      <div class="row"><input id="city" required placeholder="City"><input id="state" required placeholder="State"><input id="pin" required inputmode="numeric" maxlength="6" placeholder="PIN code"></div>
+      <input id="pan" required maxlength="10" placeholder="PAN (ABCDE1234F)" style="text-transform:uppercase" autocomplete="off">
+      <input id="aadhaar" required inputmode="numeric" maxlength="12" placeholder="Aadhaar number (12 digits)" autocomplete="off">
+      <div class="row">${sel("occupation", ["Salaried", "Self-employed", "Business", "Student", "Homemaker", "Retired", "Other"])}${sel("income", ["Below ₹2.5 lakh", "₹2.5-5 lakh", "₹5-10 lakh", "₹10-25 lakh", "Above ₹25 lakh"])}</div>
+      <div class="row">${sel("accType", ["Savings", "Current"])}</div>
+      <div class="row"><input id="nomName" required placeholder="Nominee name"><input id="nomRel" required placeholder="Nominee relation"></div>
+      <label class="note"><input type="checkbox" id="c1"> I declare the details are true and consent to KYC.</label>
+      <label class="note"><input type="checkbox" id="c2"> I accept the account terms.</label>
+      <p class="note">Privacy: only the last 4 digits of Aadhaar and a masked PAN are stored. Full numbers are never saved.</p>
+      <p class="err" id="kycErr"></p>
+      <button class="primary">Open account</button><button type="button" class="link" data-act="logout">Sign out</button></form>`;
+  },
+  dash: () => {
+    const adm = S.me.isAdmin, T = S.tab;
+    const nav = [["home", "🏠", "Home"], ["pay", "💸", "Pay"], ["hist", "📜", "History"]].concat(adm ? [["admin", "🛠️", "Admin"]] : []);
+    const back = T === "home" ? "" : `<div class="row"><button class="link" data-act="${T === "pay" && S.pay ? "payCancel" : "tab"}" data-t="home">← Back</button></div>`;
+    return back + (T === "add" ? addView() : T === "pay" ? payView() : T === "hist" ? histView() : T === "admin" && adm ? adminView() : homeView())
+      + `<nav class="nav">${nav.map((n) => `<button data-act="tab" data-t="${n[0]}" class="${T === n[0] ? "on" : ""}"><span style="font-size:1.3rem">${n[1]}</span>${n[2]}</button>`).join("")}</nav>`;
+  },
+};
+
+function render(keepFocus) {
+  const v = $("#view"); if (!v) return;
+  let name;
+  if (S.user === undefined) name = "loading";
+  else if (!S.user) name = "auth";
+  else name = S.needKyc ? "kyc" : S.me ? "dash" : "loading";
+  v.innerHTML = views[name]();
+}
+
+const pinHash = async (pin, salt) => {
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(pin), "PBKDF2", false, ["deriveBits"]);
+  const b = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: new TextEncoder().encode(salt), iterations: 100000, hash: "SHA-256" }, k, 256);
+  return [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
+};
+const pinRef = () => db.collection("apexPins").doc(S.user.uid);
+async function pinLoad() { try { const d = await pinRef().get(); S.pinDoc = d.exists ? d.data() : null; } catch (e) { S.pinDoc = null; } S.pinSet = !!S.pinDoc; }
+async function pinSave(pin) { const salt = crypto.randomUUID(); S.pinDoc = { salt, hash: await pinHash(pin, salt), updatedAt: Date.now() }; await pinRef().set(S.pinDoc); S.pinSet = true; }
+async function pinCheck(pin) {
+  if (!/^\d{4}$/.test(pin)) throw new Error("Enter your 4-digit PIN");
+  const key = "apexPinLock_" + S.user.uid, lk = JSON.parse(localStorage.getItem(key) || '{"n":0,"until":0}');
+  if (Date.now() < lk.until) throw new Error("Too many wrong attempts. Try again in " + Math.ceil((lk.until - Date.now()) / 60000) + " min");
+  if ((await pinHash(pin, S.pinDoc.salt)) !== S.pinDoc.hash) {
+    if (++lk.n >= 3) { lk.until = Date.now() + 300000; lk.n = 0; }
+    localStorage.setItem(key, JSON.stringify(lk)); throw new Error("Wrong PIN");
+  }
+  localStorage.setItem(key, '{"n":0,"until":0}');
+}
+function showBal() { S.balShow = true; S.pinMode = ""; S.sErr = ""; clearTimeout(window._bt); window._bt = setTimeout(() => { S.balShow = false; if (S.tab === "home" && !S.pinMode) render(); }, 15000); render(); }
+async function loadTx() {
+  try {
+    S.txns = await svc.txns(S.user.uid);
+    const key = "apexSeen_" + S.user.uid, raw = localStorage.getItem(key), seen = new Set(raw ? JSON.parse(raw) : S.txns.map((t) => t.id));
+    S.txns.forEach((t) => {
+      if (t.type === "TRANSFER" && t.toUid === S.user.uid && !seen.has(t.id) && S.me)
+        notify(S.user.email, "Credited " + inr(t.amountPaise), inr(t.amountPaise) + " credited to A/C " + S.me.accountNumber + " from " + t.fromName + (t.note ? " (" + t.note + ")" : "") + ".");
+      seen.add(t.id);
+    });
+    localStorage.setItem(key, JSON.stringify([...seen]));
+  } catch (e) { console.error(e); }
+  if (S.tab === "home" || S.tab === "hist") render();
+}
+
+let routing = false;
+async function route() {
+  if (routing) return; routing = true;
+  try { await route2(); } finally { routing = false; }
+}
+async function route2() {
+  S.user = svc.current(); S.err = ""; S.msg = "";
+  if (S.unwatch) { S.unwatch(); S.unwatch = null; }
+  if (S.user) {
+    render();
+    try {
+      S.me = await svc.enter(S.user);
+      if (S.me.needKyc) { S.needKyc = true; S.me = null; render(); return; }
+      S.needKyc = false; loadTx(); pinLoad();
+      const un = svc.watch(S.me.accountNumber, (b) => { const ch = S.bal !== null && b !== S.bal; S.bal = b; if (ch) loadTx(); const el = $("#bal"); if (el) el.textContent = S.balShow ? inr(b) : "₹ ••••••"; else render(); });
+      S.unwatch = typeof un === "function" ? un : null;
+    } catch (e) { S.err = fmtErr(e); S.me = null; $("#view").innerHTML = `<div class="card"><p class="err">${esc(S.err)}</p><button data-act="logout">Sign out</button></div>`; return; }
+  } else { S.needKyc = false; S.me = null; S.bal = null; S.res = null; S.otpSent = false; S.users = null; S.tab = "home"; S.txns = []; S.allTx = null; S.pay = null; S.ok = ""; S.reqs = []; S.pending = null; S.balShow = false; S.pinMode = ""; S.pinSet = null; S.pinDoc = null; }
+  render();
+}
+
+async function act(fn) { try { await fn(); } catch (e) { S.err = fmtErr(e); if (S.me) S.sErr = S.err; render(); } }
+
+document.addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (e.target.id === "authForm") act(async () => {
+    const email = $("#email").value.trim().toLowerCase(), pass = $("#pass").value;
+    if (S.mode === "register") {
+      const name = $("#name").value.trim();
+      if (name.length < 2) throw new Error("Enter your full name");
+      await otpStart(name, email, pass); S.otpSent = true; S.err = ""; S.msg = ""; render();
+    } else await svc.login(email, pass);
+  });
+  if (e.target.id === "otpForm") act(async () => { await otpVerify($("#otp").value.trim()); S.otpSent = false; S.err = ""; S.msg = ""; await route(); });
+  if (e.target.id === "kycForm") act(async () => {
+    const v = (id) => $("#" + id).value.trim(), er = (m) => { $("#kycErr").textContent = m; };
+    const pan = v("pan").toUpperCase(), aad = v("aadhaar").replace(/\s/g, "");
+    if (!v("dob") || ageOf(v("dob")) < 18) return er("You must be 18 or older to open an account");
+    if (!/^[6-9][0-9]{9}$/.test(v("mobile"))) return er("Enter a valid 10-digit mobile number");
+    if (!/^[1-9][0-9]{5}$/.test(v("pin"))) return er("Enter a valid 6-digit PIN code");
+    if (!/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan)) return er("PAN must look like ABCDE1234F");
+    if (!validAadhaar(aad)) return er("Enter a valid 12-digit Aadhaar number");
+    if (!$("#c1").checked || !$("#c2").checked) return er("Please accept both declarations");
+    er("");
+    await svc.openAccount(S.user, { fullName: v("fullName"), accountType: v("accType"), phone: "+91" + v("mobile"), kyc: {
+      dob: v("dob"), gender: v("gender"), fatherName: v("fatherName"), address: v("addr"), city: v("city"), state: v("state"), pin: v("pin"),
+      panMasked: pan.slice(0, 2) + "XXX" + pan.slice(5, 9).replace(/\d/g, "X") + pan.slice(9), aadhaarLast4: aad.slice(-4),
+      occupation: v("occupation"), incomeRange: v("income"), nomineeName: v("nomName"), nomineeRelation: v("nomRel"), status: "SUBMITTED" } });
+    await route();
+  });
+  if (e.target.id === "pinSetForm" || e.target.id === "pinForgotForm") act(async () => {
+    const pin = $("#pin").value, pin2 = $("#pin2").value;
+    if (!/^\d{4}$/.test(pin)) throw new Error("PIN must be exactly 4 digits");
+    if (pin !== pin2) throw new Error("PINs do not match");
+    if (e.target.id === "pinForgotForm") await auth.currentUser.reauthenticateWithCredential(firebase.auth.EmailAuthProvider.credential(S.user.email, $("#fpw").value));
+    await pinSave(pin); showBal();
+  });
+  if (e.target.id === "pinCheckForm") act(async () => { await pinLoad(); if (!S.pinDoc) throw new Error("PIN not set"); await pinCheck($("#pin").value); showBal(); });
+  if (e.target.id === "addForm") act(async () => {
+    const amt = Math.round(parseFloat($("#aamt").value) * 100); S.ok = ""; S.sErr = "";
+    if (!amt || amt <= 0 || amt > 10000000) throw new Error("Enter an amount between ₹1 and ₹1,00,000");
+    await svc.addMoney(S.user.uid, S.me, amt, ""); notify(S.user.email, "Credited " + inr(amt), inr(amt) + " added to A/C " + S.me.accountNumber + "."); S.ok = inr(amt) + " added to your account"; await loadTx(); render();
+  });
+  if (e.target.id === "payForm") act(async () => {
+    const acc = $("#pacc").value.replace(/\D/g, ""), amt = Math.round(parseFloat($("#pamt").value) * 100), note = $("#pnote").value.trim();
+    S.ok = ""; S.sErr = "";
+    if (!/^[1-9]\d{11}$/.test(acc)) throw new Error("Account number must be exactly 12 digits");
+    if (acc === S.me.accountNumber) throw new Error("You can't send money to your own account");
+    if (!amt || amt <= 0) throw new Error("Enter a valid amount");
+    if (S.bal !== null && amt > S.bal) throw new Error("Insufficient balance");
+    const r = await svc.lookup(acc); if (!r) throw new Error("Account not found");
+    S.pay = { acc, name: r.fullName, uid: r.uid, amt, note }; render();
+  });
+  if (e.target.id === "searchForm") {
+    const acc = $("#sacc").value.replace(/\D/g, ""); S.res = null; S.sErr = "";
+    if (!/^[1-9]\d{11}$/.test(acc)) { S.sErr = "Account number must be exactly 12 digits"; render(); return; }
+    svc.search(acc).then((r) => { if (!r) S.sErr = "Secure Banking Exception: Account Not Found"; S.res = r; render(); $("#sacc").value = acc; })
+      .catch((x) => { S.sErr = fmtErr(x); render(); });
+  }
+});
+
+document.addEventListener("click", (e) => {
+  const a = e.target.closest("[data-act]"); if (!a) return;
+  const k = a.dataset.act;
+  if (k === "toggle") { S.mode = S.mode === "login" ? "register" : "login"; S.err = ""; S.otpSent = false; render(); }
+  if (k === "logout") { sessionStorage.removeItem("apexLogged"); svc.logout(); }
+  if (k === "tab") { S.tab = a.dataset.t; S.pay = null; S.ok = ""; S.sErr = ""; render(); if (S.tab === "admin" && S.me.isAdmin) svc.allTxns().then((x) => { S.allTx = x; render(); }).catch(() => {}); if (S.tab === "admin" && S.me.isAdmin) svc.adminUsers().then((x) => { S.users = x; render(); }).catch(() => {}); }
+  if (k === "checkBal") act(async () => { await pinLoad(); S.pinMode = S.pinSet ? "check" : "set"; S.sErr = ""; render(); });
+  if (k === "hideBal") { S.balShow = false; render(); }
+  if (k === "pinClose") { S.pinMode = ""; S.sErr = ""; render(); }
+  if (k === "pinForgot") { S.pinMode = "forgot"; S.sErr = ""; render(); }
+  if (k === "payCancel") { S.pay = null; S.sErr = ""; render(); }
+  if (k === "payGo") act(async () => { const p = S.pay, pin = $("#ppin").value; await pinLoad(); if (!S.pinDoc) throw new Error("Set your PIN first: Home → Check balance"); await pinCheck(pin); await svc.transfer(S.user.uid, S.me, p); notify(S.user.email, "Debited " + inr(p.amt), inr(p.amt) + " debited from A/C " + S.me.accountNumber + " and sent to " + p.name + " (A/C " + p.acc + ")" + (p.note ? " - " + p.note : "") + "."); S.ok = "Sent " + inr(p.amt) + " to " + p.name; S.pay = null; S.sErr = ""; await loadTx(); render(); });
+  if (k === "loadAllTx") act(async () => { S.allTx = await svc.allTxns(); render(); });
+  if (k === "stmt") {
+    const u = S.user.uid, q = (x) => '"' + String(x).replace(/"/g, '""') + '"';
+    const rows = ["Date,Description,Credit,Debit,Note"].concat(S.txns.map((t) => { const cr = t.toUid === u; return [q(new Date(t.ts).toLocaleString("en-IN")), q(t.type === "TRANSFER" ? (cr ? "From " + t.fromName : "To " + t.toName) : (t.type === "ADD_MONEY" ? "Money added" : cr ? "Bank credit" : "Bank debit")), cr ? t.amountPaise / 100 : "", cr ? "" : t.amountPaise / 100, q(t.note || "")].join(","); }));
+    const l = document.createElement("a"); l.href = URL.createObjectURL(new Blob([rows.join("\n")], { type: "text/csv" })); l.download = "ApexVolt-statement.csv"; l.click();
+  }
+  if (k === "resendOtp") act(async () => { await otpStart(regInfo.name, regInfo.email, regInfo.pass); S.err = ""; S.msg = "OTP re-sent."; render(); });
+  if (k === "changeEmail") { pendingReg = null; S.otpSent = false; S.err = ""; S.msg = ""; render(); }
+  if (k === "loadUsers") (async () => { try { S.users = await svc.adminUsers(); S.usersErr = ""; } catch (x) { S.usersErr = fmtErr(x); } render(); })();
+  if (k === "credit" || k === "debit") act(async () => {
+    const amt = Math.round(parseFloat($("#amt").value) * 100), why = $("#why").value.trim();
+    if (!amt || amt <= 0 || why.length < 3) { S.sErr = "Enter a valid amount and a reason"; render(); return; }
+    await svc.adjust(S.res.accountNumber, k === "credit" ? amt : -amt, why, S.user);
+    S.res = await svc.search(S.res.accountNumber); S.sErr = ""; render();
+  });
+});
+
+/* boot */
+if (!LIVE) $("#banner").innerHTML = `<div class="banner">Demo mode: ${window.firebase ? "Firebase config is not pasted yet (see CFG in this file)." : "Firebase scripts could not load (adblock/offline?)."} Data stays in this browser only. Tip: an email starting with "admin" gets admin tools in demo.</div>`;
+svc.init();
+svc.onUser(() => route());
+</script>
+</body>
+</html>
